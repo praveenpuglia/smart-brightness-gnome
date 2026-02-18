@@ -4,20 +4,9 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 // ── Configuration ──────────────────────────────────────────────────
-// The connector name for the built-in laptop display.
-// Run `ddcutil detect` or check GNOME Display settings to find yours.
 const BUILTIN_CONNECTOR = 'eDP-1';
-
-// Brightness step per keypress (0-100 scale).
 const DDC_STEP = 5;
-
-// Debounce interval in ms — rapid keypresses are coalesced into a
-// single DDC write to avoid flooding the slow I2C bus.
 const DEBOUNCE_MS = 150;
-
-// ddcutil sleep multiplier for writes. Lower = faster but may cause
-// DDCRC_NULL_RESPONSE errors. 0.5 is a safe default; try 0.3 if your
-// monitor handles it.
 const DDC_SLEEP_MULTIPLIER = '0.5';
 // ───────────────────────────────────────────────────────────────────
 
@@ -36,7 +25,6 @@ export default class SmartBrightnessExtension extends Extension {
         this._builtinMonitorIndex = monitorManager.get_monitor_for_connector(BUILTIN_CONNECTOR);
         this._updateExternalIndex();
 
-        // Re-detect monitors on hotplug (dock/undock)
         this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => {
             const mgr = global.backend.get_monitor_manager();
             this._builtinMonitorIndex = mgr.get_monitor_for_connector(BUILTIN_CONNECTOR);
@@ -46,12 +34,30 @@ export default class SmartBrightnessExtension extends Extension {
             this._detectBus();
         });
 
-        // Auto-detect the I2C bus for the external DDC monitor
         this._detectBus();
 
-        // Listen for brightness changes from gsd-power via D-Bus.
-        // Using signal_subscribe (not Gio.DBusProxy) so it works even
-        // if gsd-power starts after the extension.
+        // Monkey-patch OSD to suppress gsd-power's brightness OSD
+        // when focus is on the external monitor. We check focus and
+        // icon name directly inside show() so there's no race with
+        // the D-Bus PropertiesChanged signal.
+        this._origOsdShow = Main.osdWindowManager.show.bind(Main.osdWindowManager);
+        Main.osdWindowManager.show = (monitorIndex, icon, label, level, maxLevel) => {
+            // Check if this is a brightness OSD
+            const iconNames = icon?.get_names?.() ?? [];
+            const isBrightness = iconNames.some(n => n.includes('brightness'));
+            if (isBrightness) {
+                const focusWindow = global.display.focus_window;
+                if (focusWindow) {
+                    const focusMonitor = focusWindow.get_monitor();
+                    if (focusMonitor !== this._builtinMonitorIndex) {
+                        // Focus is on external monitor — suppress gsd-power's OSD
+                        return;
+                    }
+                }
+            }
+            this._origOsdShow(monitorIndex, icon, label, level, maxLevel);
+        };
+
         this._signalId = Gio.DBus.session.signal_subscribe(
             'org.gnome.SettingsDaemon.Power',
             'org.freedesktop.DBus.Properties',
@@ -113,9 +119,9 @@ export default class SmartBrightnessExtension extends Extension {
         }
     }
 
-    // ── Read current DDC brightness (for accurate OSD) ─────────────
+    // ── Read current DDC brightness ────────────────────────────────
 
-    _readDDCBrightness() {
+    _readDDCBrightness(callback) {
         if (!this._ddcBus) return;
         try {
             const proc = Gio.Subprocess.new(
@@ -127,18 +133,19 @@ export default class SmartBrightnessExtension extends Extension {
                 try {
                     proc_.wait_finish(result);
                     const [, stdout] = proc_.communicate_utf8(null, null);
-                    // Terse format: VCP 10 C <current> <max>
                     const match = stdout.match(/VCP\s+10\s+C\s+(\d+)\s+(\d+)/);
                     if (match) {
                         this._ddcBrightness = parseInt(match[1]);
-                        log(`[SmartBrightness] DDC brightness: ${this._ddcBrightness}`);
+                        log(`[SmartBrightness] DDC brightness read: ${this._ddcBrightness}`);
                     }
                 } catch (e) {
                     logError(e, 'SmartBrightness read');
                 }
+                if (callback) callback();
             });
         } catch (e) {
             logError(e, 'SmartBrightness read');
+            if (callback) callback();
         }
     }
 
@@ -146,13 +153,13 @@ export default class SmartBrightnessExtension extends Extension {
 
     _showOSD(monitorIndex, level) {
         const icon = Gio.ThemedIcon.new_with_default_fallbacks('display-brightness-symbolic');
-        Main.osdWindowManager.show(monitorIndex, icon, null, level / 100);
+        // Call _origOsdShow directly — bypasses our patch so it always shows
+        this._origOsdShow(monitorIndex, icon, null, level / 100);
     }
 
     // ── Brightness change handler ──────────────────────────────────
 
     _onBrightnessChanged(params) {
-        // Ignore signals triggered by our own revert
         if (this._reverting)
             return;
 
@@ -173,13 +180,12 @@ export default class SmartBrightnessExtension extends Extension {
 
         const monitorIndex = focusWindow.get_monitor();
 
-        // If focused on the built-in display, let gsd-power handle it
         if (monitorIndex === this._builtinMonitorIndex)
             return;
 
         const step = newVal > oldVal ? DDC_STEP : -DDC_STEP;
 
-        // Revert the built-in backlight change (async)
+        // Revert the built-in backlight change
         this._reverting = true;
         Gio.DBus.session.call(
             'org.gnome.SettingsDaemon.Power',
@@ -197,13 +203,13 @@ export default class SmartBrightnessExtension extends Extension {
                 this._reverting = false;
             });
 
-        // Show OSD immediately on the external monitor with predicted value
+        // Show OSD on external monitor only
         if (this._ddcBrightness >= 0) {
             this._ddcBrightness = Math.max(0, Math.min(100, this._ddcBrightness + step));
             this._showOSD(this._externalMonitorIndex, this._ddcBrightness);
         }
 
-        // Accumulate delta and debounce to avoid flooding the I2C bus
+        // Accumulate and debounce DDC
         this._pendingDelta += step;
 
         if (this._debounceId !== null)
@@ -216,7 +222,7 @@ export default class SmartBrightnessExtension extends Extension {
         });
     }
 
-    // ── DDC write (serialized, one at a time) ──────────────────────
+    // ── DDC write (serialized) ─────────────────────────────────────
 
     _flushDDC() {
         const delta = this._pendingDelta;
@@ -247,9 +253,12 @@ export default class SmartBrightnessExtension extends Extension {
                     logError(e, 'SmartBrightness ddcutil');
                 }
                 this._ddcRunning = false;
-                // Drain any deltas that accumulated while this write ran
-                if (this._pendingDelta !== 0)
+
+                if (this._pendingDelta !== 0) {
                     this._flushDDC();
+                } else {
+                    this._readDDCBrightness();
+                }
             });
         } catch (e) {
             logError(e, 'SmartBrightness ddcutil');
@@ -260,6 +269,11 @@ export default class SmartBrightnessExtension extends Extension {
     // ── Cleanup ────────────────────────────────────────────────────
 
     disable() {
+        // Restore original OSD
+        if (this._origOsdShow) {
+            Main.osdWindowManager.show = this._origOsdShow;
+            this._origOsdShow = null;
+        }
         if (this._signalId) {
             Gio.DBus.session.signal_unsubscribe(this._signalId);
             this._signalId = null;
