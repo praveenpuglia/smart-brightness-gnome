@@ -1,0 +1,8 @@
+{
+  "name": "Smart Brightness",
+  "description": "Routes brightness keys to the correct monitor based on focused window. When focused on an external DDC/CI monitor, brightness keys adjust the external display via ddcutil instead of the built-in backlight.",
+  "uuid": "smart-brightness@local",
+  "url": "",
+  "shell-version": ["46"],
+  "session-modes": ["user"]
+}
