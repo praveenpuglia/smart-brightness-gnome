@@ -12,8 +12,6 @@ const DDC_SLEEP_MULTIPLIER = '0.5';
 
 export default class SmartBrightnessExtension extends Extension {
     enable() {
-        this._lastBrightness = -1;
-        this._reverting = false;
         this._pendingDelta = 0;
         this._debounceId = null;
         this._ddcRunning = false;
@@ -35,39 +33,7 @@ export default class SmartBrightnessExtension extends Extension {
         });
 
         this._detectBus();
-
-        // Monkey-patch OSD to suppress gsd-power's brightness OSD
-        // when focus is on the external monitor. We check focus and
-        // icon name directly inside show() so there's no race with
-        // the D-Bus PropertiesChanged signal.
-        this._origOsdShow = Main.osdWindowManager.show.bind(Main.osdWindowManager);
-        Main.osdWindowManager.show = (monitorIndex, icon, label, level, maxLevel) => {
-            // Check if this is a brightness OSD
-            const iconNames = icon?.get_names?.() ?? [];
-            const isBrightness = iconNames.some(n => n.includes('brightness'));
-            if (isBrightness) {
-                const focusWindow = global.display.focus_window;
-                if (focusWindow) {
-                    const focusMonitor = focusWindow.get_monitor();
-                    if (focusMonitor !== this._builtinMonitorIndex) {
-                        // Focus is on external monitor — suppress gsd-power's OSD
-                        return;
-                    }
-                }
-            }
-            this._origOsdShow(monitorIndex, icon, label, level, maxLevel);
-        };
-
-        this._signalId = Gio.DBus.session.signal_subscribe(
-            'org.gnome.SettingsDaemon.Power',
-            'org.freedesktop.DBus.Properties',
-            'PropertiesChanged',
-            '/org/gnome/SettingsDaemon/Power',
-            'org.gnome.SettingsDaemon.Power.Screen',
-            Gio.DBusSignalFlags.NONE,
-            (conn, sender, path, iface, signal, params) => {
-                this._onBrightnessChanged(params);
-            });
+        this._patchBrightnessManager();
 
         log('[SmartBrightness] Enabled');
     }
@@ -81,6 +47,79 @@ export default class SmartBrightnessExtension extends Extension {
             }
         }
         this._externalMonitorIndex = -1;
+    }
+
+    _focusOnExternal() {
+        const focusWindow = global.display.focus_window;
+        if (!focusWindow)
+            return false;
+        return focusWindow.get_monitor() !== this._builtinMonitorIndex;
+    }
+
+    // ── BrightnessManager integration (GNOME 49+) ──────────────────
+
+    _patchBrightnessManager() {
+        const bm = Main.brightnessManager;
+        if (!bm) {
+            log('[SmartBrightness] Main.brightnessManager unavailable');
+            return;
+        }
+
+        this._brightnessManager = bm;
+        this._origScreenBrightnessUp = bm._screenBrightnessUp.bind(bm);
+        this._origScreenBrightnessDown = bm._screenBrightnessDown.bind(bm);
+        this._origScreenBrightnessCycle = bm._screenBrightnessCycle.bind(bm);
+
+        bm._screenBrightnessUp = () => {
+            this._handleBrightnessKey(DDC_STEP, this._origScreenBrightnessUp);
+        };
+        bm._screenBrightnessDown = () => {
+            this._handleBrightnessKey(-DDC_STEP, this._origScreenBrightnessDown);
+        };
+        bm._screenBrightnessCycle = () => {
+            this._handleBrightnessKey(DDC_STEP, this._origScreenBrightnessCycle);
+        };
+    }
+
+    _unpatchBrightnessManager() {
+        const bm = this._brightnessManager;
+        if (!bm)
+            return;
+
+        if (this._origScreenBrightnessUp)
+            bm._screenBrightnessUp = this._origScreenBrightnessUp;
+        if (this._origScreenBrightnessDown)
+            bm._screenBrightnessDown = this._origScreenBrightnessDown;
+        if (this._origScreenBrightnessCycle)
+            bm._screenBrightnessCycle = this._origScreenBrightnessCycle;
+
+        this._origScreenBrightnessUp = null;
+        this._origScreenBrightnessDown = null;
+        this._origScreenBrightnessCycle = null;
+        this._brightnessManager = null;
+    }
+
+    _handleBrightnessKey(step, fallback) {
+        if (!this._ddcBus || !this._focusOnExternal()) {
+            fallback();
+            return;
+        }
+
+        if (this._ddcBrightness >= 0) {
+            this._ddcBrightness = Math.max(0, Math.min(100, this._ddcBrightness + step));
+            this._showOSD(this._externalMonitorIndex, this._ddcBrightness);
+        }
+
+        this._pendingDelta += step;
+
+        if (this._debounceId !== null)
+            GLib.source_remove(this._debounceId);
+
+        this._debounceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, DEBOUNCE_MS, () => {
+            this._debounceId = null;
+            this._flushDDC();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     // ── DDC bus detection ──────────────────────────────────────────
@@ -152,74 +191,12 @@ export default class SmartBrightnessExtension extends Extension {
     // ── OSD ────────────────────────────────────────────────────────
 
     _showOSD(monitorIndex, level) {
+        if (monitorIndex < 0)
+            return;
+
         const icon = Gio.ThemedIcon.new_with_default_fallbacks('display-brightness-symbolic');
-        // Call _origOsdShow directly — bypasses our patch so it always shows
-        this._origOsdShow(monitorIndex, icon, null, level / 100);
-    }
-
-    // ── Brightness change handler ──────────────────────────────────
-
-    _onBrightnessChanged(params) {
-        if (this._reverting)
-            return;
-
-        const [iface_, changed, invalidated_] = params.recursiveUnpack();
-        if (!('Brightness' in changed))
-            return;
-
-        const newVal = changed['Brightness'];
-        const oldVal = this._lastBrightness;
-        this._lastBrightness = newVal;
-
-        if (oldVal < 0 || newVal === oldVal)
-            return;
-
-        const focusWindow = global.display.focus_window;
-        if (!focusWindow)
-            return;
-
-        const monitorIndex = focusWindow.get_monitor();
-
-        if (monitorIndex === this._builtinMonitorIndex)
-            return;
-
-        const step = newVal > oldVal ? DDC_STEP : -DDC_STEP;
-
-        // Revert the built-in backlight change
-        this._reverting = true;
-        Gio.DBus.session.call(
-            'org.gnome.SettingsDaemon.Power',
-            '/org/gnome/SettingsDaemon/Power',
-            'org.freedesktop.DBus.Properties',
-            'Set',
-            new GLib.Variant('(ssv)', [
-                'org.gnome.SettingsDaemon.Power.Screen',
-                'Brightness',
-                GLib.Variant.new_int32(oldVal),
-            ]),
-            null, Gio.DBusCallFlags.NONE, -1, null,
-            () => {
-                this._lastBrightness = oldVal;
-                this._reverting = false;
-            });
-
-        // Show OSD on external monitor only
-        if (this._ddcBrightness >= 0) {
-            this._ddcBrightness = Math.max(0, Math.min(100, this._ddcBrightness + step));
-            this._showOSD(this._externalMonitorIndex, this._ddcBrightness);
-        }
-
-        // Accumulate and debounce DDC
-        this._pendingDelta += step;
-
-        if (this._debounceId !== null)
-            GLib.source_remove(this._debounceId);
-
-        this._debounceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, DEBOUNCE_MS, () => {
-            this._debounceId = null;
-            this._flushDDC();
-            return GLib.SOURCE_REMOVE;
-        });
+        // GNOME 49+: showOne(monitorIndex, icon, label, level, maxLevel)
+        Main.osdWindowManager.showOne(monitorIndex, icon, null, level / 100);
     }
 
     // ── DDC write (serialized) ─────────────────────────────────────
@@ -269,15 +246,8 @@ export default class SmartBrightnessExtension extends Extension {
     // ── Cleanup ────────────────────────────────────────────────────
 
     disable() {
-        // Restore original OSD
-        if (this._origOsdShow) {
-            Main.osdWindowManager.show = this._origOsdShow;
-            this._origOsdShow = null;
-        }
-        if (this._signalId) {
-            Gio.DBus.session.signal_unsubscribe(this._signalId);
-            this._signalId = null;
-        }
+        this._unpatchBrightnessManager();
+
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
             this._monitorsChangedId = null;
