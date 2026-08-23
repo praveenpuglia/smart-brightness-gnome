@@ -53,8 +53,16 @@ The I2C bus number for the external monitor is **auto-detected** at startup (it 
 ## Debugging
 
 ```sh
-# Check extension status
-gnome-extensions show smart-brightness@local
+# Check extension status — it must say ENABLED.
+#
+# INITIALIZED means the extension loaded but enable() never ran. The usual
+# cause is the global user-extensions switch, which silently overrides
+# enabled-extensions:
+#   gsettings get org.gnome.shell disable-user-extensions   # must be false
+#
+# OUT OF DATE means shell-version in metadata.json does not cover your
+# GNOME Shell. gnome-extensions enable refuses to enable it in that state.
+gnome-extensions info smart-brightness@local
 
 # View logs
 journalctl -b _COMM=gnome-shell | grep SmartBrightness

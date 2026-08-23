@@ -35,10 +35,17 @@ echo "[4/4] Installing GNOME Shell extension..."
 mkdir -p "$EXT_DIR"
 cp extension.js metadata.json "$EXT_DIR/"
 
-# Enable the extension
-gnome-extensions enable "$EXT_UUID" 2>/dev/null || \
-    gsettings set org.gnome.shell enabled-extensions \
-        "$(gsettings get org.gnome.shell enabled-extensions | sed "s/]/, '$EXT_UUID']/")"
+# Enable the extension.
+#
+# The global "user extensions" switch overrides enabled-extensions entirely.
+# If it is on, the extension installs and loads but enable() is never called,
+# leaving it stuck in State: INITIALIZED with no error anywhere.
+if [ "$(gsettings get org.gnome.shell disable-user-extensions)" = "true" ]; then
+    echo "      User extensions are globally disabled — enabling them."
+    gsettings set org.gnome.shell disable-user-extensions false
+fi
+
+gnome-extensions enable "$EXT_UUID"
 
 echo
 echo "=== Done ==="
