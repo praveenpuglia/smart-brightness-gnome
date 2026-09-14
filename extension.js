@@ -14,6 +14,13 @@ const DEBOUNCE_MS = 150;
 const DDC_SLEEP_MULTIPLIER = '0.5';
 // ───────────────────────────────────────────────────────────────────
 
+// Skip the per-invocation unsupported-feature probes (VCP 0x00/0x41/0xdd).
+// They add extra I2C round-trips to every call; some panels (e.g. Dell)
+// answer them as if they were valid and ddcutil WARN-logs that to the journal.
+function ddcutilCmd(...args) {
+    return ['ddcutil', '--skip-ddc-checks', ...args];
+}
+
 export default class SmartBrightnessExtension extends Extension {
     enable() {
         this._debounceId = null;
@@ -166,7 +173,7 @@ export default class SmartBrightnessExtension extends Extension {
     _detectDisplays() {
         try {
             const proc = Gio.Subprocess.new(
-                ['ddcutil', 'detect', '--brief'],
+                ddcutilCmd('detect', '--brief'),
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
 
             proc.wait_async(null, (proc_, result) => {
@@ -234,8 +241,8 @@ export default class SmartBrightnessExtension extends Extension {
 
         try {
             const proc = Gio.Subprocess.new(
-                ['ddcutil', '--bus', target.bus, '--sleep-multiplier', '0.1',
-                 '--terse', 'getvcp', '10'],
+                ddcutilCmd('--bus', target.bus, '--sleep-multiplier', '0.1',
+                           '--terse', 'getvcp', '10'),
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
 
             proc.wait_async(null, (proc_, result) => {
@@ -298,9 +305,9 @@ export default class SmartBrightnessExtension extends Extension {
 
         try {
             const proc = Gio.Subprocess.new(
-                ['ddcutil', '--bus', target.bus,
-                 '--sleep-multiplier', DDC_SLEEP_MULTIPLIER,
-                 'setvcp', '10', sign, amount],
+                ddcutilCmd('--bus', target.bus,
+                           '--sleep-multiplier', DDC_SLEEP_MULTIPLIER,
+                           'setvcp', '10', sign, amount),
                 Gio.SubprocessFlags.NONE);
 
             proc.wait_async(null, (proc_, result) => {
