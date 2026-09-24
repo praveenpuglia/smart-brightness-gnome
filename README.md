@@ -1,13 +1,14 @@
 # Smart Brightness for GNOME
 
-A GNOME Shell extension that routes brightness keys to the correct monitor based on which window is focused.
+A GNOME Shell extension that routes brightness keys to the correct monitor based on which display the pointer is on.
 
-- **Focused on external monitor** — brightness keys adjust the external display via DDC/CI (`ddcutil`)
-- **Focused on built-in display** — brightness keys work as usual (backlight)
+- **Pointer on an external monitor** — brightness keys adjust that display via DDC/CI (`ddcutil`)
+- **Pointer on the built-in display** — brightness keys work as usual (backlight)
+- **Multiple external monitors** — each DDC-capable display is controlled independently
 
 ## Requirements
 
-- GNOME Shell 46 (Ubuntu 24.04 LTS)
+- GNOME Shell 49 or 50 (e.g. Fedora 43/44)
 - An external monitor that supports DDC/CI (most modern monitors do)
 - `ddcutil` — DDC/CI control tool
 
@@ -40,15 +41,15 @@ Edit the constants at the top of `extension.js`:
 
 ## How it works
 
-1. `gsd-power` (GNOME's power daemon) handles brightness keys and adjusts the built-in backlight
-2. This extension monitors those brightness changes via D-Bus (`org.gnome.SettingsDaemon.Power.Screen`)
-3. When a change is detected and the focused window is on the **external** monitor:
-   - The built-in backlight change is **reverted** (set back to its previous value)
-   - The external monitor brightness is adjusted via **DDC/CI** (`ddcutil setvcp 10`)
-   - An **OSD** (on-screen brightness indicator) is shown on the external monitor
-4. When focused on the built-in display, brightness keys work normally
+1. GNOME Shell's `BrightnessManager` (since GNOME 49) handles brightness keys for displays with a `Meta.Backlight` (typically the laptop panel)
+2. This extension intercepts the Shell brightness key handlers (`screen-brightness-up` / `down` / `cycle`, and the per-monitor variants)
+3. When the pointer is on an **external** DDC/CI monitor:
+   - The built-in backlight is left unchanged
+   - That monitor's brightness is adjusted via **DDC/CI** (`ddcutil setvcp 10`)
+   - An **OSD** is shown on that monitor via `OsdWindowManager.showOne()`
+4. When the pointer is on the built-in display, brightness keys work normally through `BrightnessManager`
 
-The I2C bus number for the external monitor is **auto-detected** at startup (it can change across reboots).
+All DDC-capable external monitors are **auto-detected** at startup (I2C bus numbers can change across reboots).
 
 ## Debugging
 
@@ -83,9 +84,9 @@ ddcutil --bus <N> setvcp 10 50      # set to 50%
 
 - **ACPI brightness switch.** On many Intel laptops, the kernel's ACPI subsystem intercepts brightness keys before they reach GNOME. The install script disables this via `/etc/modprobe.d/brightness.conf` (`brightness_switch_enabled=0`). The uninstall script restores it.
 
-- **Single external monitor.** The extension currently picks the first non-eDP DDC monitor it finds. Multi-external-monitor setups are not handled.
+- **GNOME 49+ only.** Relies on `Main.brightnessManager` and the GNOME 49+ OSD API (`showOne`). GNOME 46–48 need the older `gsd-power` integration.
 
-- **GNOME 46 only.** Uses ESM imports and Mutter 14 APIs. Other GNOME versions will need `shell-version` and potentially API adjustments.
+- **Logitech MX Keys brightness keys.** With **Set OS** = Windows, Fn brightness keys often emit no keycodes under Linux. Prefer keeping Windows (so modifiers stay correct) and in [Solaar](https://pwr-solaar.github.io/Solaar/) set **Key/Button Diversion** → Brightness Up/Down to **Diverted**. Solaar’s built-in rules then emit `XF86MonBrightnessUp`/`Down` (Solaar must be running; on Wayland it needs write access to `/dev/uinput`). Avoid **Set OS** = MacOS unless you want Mac-style modifier swapping (Opt/Win ↔ Cmd/Alt).
 
 ## License
 
