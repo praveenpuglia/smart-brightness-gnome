@@ -8,7 +8,7 @@ A GNOME Shell extension that routes brightness keys to the correct monitor based
 
 ## Requirements
 
-- GNOME Shell 49 or 50 (e.g. Fedora 43/44)
+- GNOME Shell 49, 50, or 51 (e.g. Fedora 43/44/45)
 - An external monitor that supports DDC/CI (most modern monitors do)
 - `ddcutil` — DDC/CI control tool
 
